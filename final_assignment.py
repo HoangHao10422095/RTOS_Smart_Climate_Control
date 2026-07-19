@@ -2,7 +2,9 @@ from yolo_uno import *
 from pins import *
 from lcd1602 import *
 from dht20 import *
+
 import asyncio
+
 
 class Semaphore:
     def __init__(self, value=1):
@@ -29,6 +31,7 @@ dht20 = DHT20()
 data_lock = Semaphore(1)
 shared_temp = 0.0
 shared_humidity = 0.0
+sensor_ready = False
 
 HEATER_SAFE_MAX = 28.0
 HEATER_WARNING_MAX = 32.0
@@ -36,7 +39,7 @@ HEATER_WARNING_MAX = 32.0
 COOLER_THRESHOLD = 30.0
 COOLER_DURATION_MS = 5000
 
-HUMIDITY_THRESHOLD = 40.0 
+HUMIDITY_THRESHOLD = 40.0
 HUMIDIFIER_GREEN_MS = 5000
 HUMIDIFIER_YELLOW_MS = 3000
 HUMIDIFIER_RED_MS = 2000
@@ -47,7 +50,7 @@ async def task_LED_Blinky():
         led_D13.toggle()
 
 async def task_read_sensor():
-    global shared_temp, shared_humidity
+    global shared_temp, shared_humidity, sensor_ready
     while True:
         t = await dht20.atemperature()
         h = await dht20.ahumidity()
@@ -55,9 +58,10 @@ async def task_read_sensor():
         await data_lock.acquire()
         shared_temp = t
         shared_humidity = h
+        sensor_ready = True
         data_lock.release()
 
-        print('[Sensor] Temp = {} C, Humidity = {} %'.format(t, h))
+        print('[Sensor] Temp = {:.1f} C, Humidity = {:.1f} %'.format(t, h))
 
         lcd1602.clear()
         lcd1602.show(str(t), 0, 0)
@@ -68,6 +72,10 @@ async def task_read_sensor():
 async def task_heater():
     state = None
     while True:
+        if not sensor_ready:
+            await asleep_ms(200)
+            continue
+
         await data_lock.acquire()
         t = shared_temp
         data_lock.release()
@@ -91,6 +99,10 @@ async def task_heater():
 
 async def task_cooler():
     while True:
+        if not sensor_ready:
+            await asleep_ms(200)
+            continue
+
         await data_lock.acquire()
         t = shared_temp
         data_lock.release()
@@ -106,6 +118,10 @@ async def task_cooler():
 
 async def task_humidifier():
     while True:
+        if not sensor_ready:
+            await asleep_ms(200)
+            continue
+
         await data_lock.acquire()
         h = shared_humidity
         data_lock.release()
@@ -135,9 +151,11 @@ async def setup():
     create_task(task_cooler())
     create_task(task_humidifier())
 
+
 async def main():
     await setup()
     while True:
         await asleep_ms(100)
+
 
 run_loop(main())

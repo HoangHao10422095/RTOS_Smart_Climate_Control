@@ -2,9 +2,7 @@ from yolo_uno import *
 from pins import *
 from lcd1602 import *
 from dht20 import *
-
 import asyncio
-
 
 class Semaphore:
     def __init__(self, value=1):

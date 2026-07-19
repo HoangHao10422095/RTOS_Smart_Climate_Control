@@ -149,11 +149,9 @@ async def setup():
     create_task(task_cooler())
     create_task(task_humidifier())
 
-
 async def main():
     await setup()
     while True:
         await asleep_ms(100)
-
 
 run_loop(main())

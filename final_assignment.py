@@ -1,150 +1,208 @@
+import asyncio
 from yolo_uno import *
-from pins import *
 from lcd1602 import *
 from dht20 import *
-import asyncio
-
-class Semaphore:
-    def __init__(self, value=1):
-        if value < 0:
-            raise ValueError("value must be >= 0")
-        self.value = value
-
-    async def acquire(self):
-        while self.value <= 0:
-            await asleep_ms(10)
-        self.value -= 1
-
-    def release(self):
-        self.value += 1
-
-led_D13 = Pins(D13_PIN)
-rgb_led_D3 = RGBLed(D3_PIN, 4)   # Heater indicator
-rgb_led_D5 = RGBLed(D5_PIN, 4)   # Cooler indicator
-rgb_led_D7 = RGBLed(D7_PIN, 4)   # Humidifier indicator
+from pins import *
 
 lcd1602 = LCD1602()
 dht20 = DHT20()
 
-data_lock = Semaphore(1)
-shared_temp = 0.0
-shared_humidity = 0.0
-sensor_ready = False
+led_D13 = Pins(D13_PIN)
+heater_led = RGBLed(D3_PIN, 4)
+cooler_led = RGBLed(D5_PIN, 4)
+humidifier_led = RGBLed(D7_PIN, 4)
+
+GREEN = hex_to_rgb("#00ff00")
+ORANGE = hex_to_rgb("#ffa500")
+RED = hex_to_rgb("#ff0000")
+OFF = hex_to_rgb("#000000")
 
 HEATER_SAFE_MAX = 28.0
-HEATER_WARNING_MAX = 32.0
+HEATER_WARNING_MAX = 35.0
 
 COOLER_THRESHOLD = 30.0
 COOLER_DURATION_MS = 5000
 
-HUMIDITY_THRESHOLD = 40.0
-HUMIDIFIER_GREEN_MS = 5000
-HUMIDIFIER_YELLOW_MS = 3000
-HUMIDIFIER_RED_MS = 2000
+HUMIDITY_THRESHOLD = 50.0
+HUMIDIFIER_GREEN_TIME = 5000
+HUMIDIFIER_YELLOW_TIME = 3000
+HUMIDIFIER_RED_TIME = 2000
+
+share_data = {
+    "temperature": 0.0,
+    "humidity": 0.0
+}
+
+data_mutex = asyncio.Semaphore(1)
+
+lcd_event = asyncio.Event()
+heater_event = asyncio.Event()
+cooler_event = asyncio.Event()
+humidifier_event = asyncio.Event()
 
 async def task_LED_Blinky():
     while True:
-        await asleep_ms(1000)
         led_D13.toggle()
+        await asleep_ms(1000)
 
 async def task_read_sensor():
-    global shared_temp, shared_humidity, sensor_ready
     while True:
-        t = await dht20.atemperature()
-        h = await dht20.ahumidity()
+        try:
+            temp = await dht20.atemperature()
+            humi = await dht20.ahumidity()
 
-        await data_lock.acquire()
-        shared_temp = t
-        shared_humidity = h
-        sensor_ready = True
-        data_lock.release()
+            await data_mutex.acquire()
+            try:
+                share_data["temperature"] = temp
+                share_data["humidity"] = humi
+            finally:
+                data_mutex.release()
 
-        print('[Sensor] Temp = {:.1f} C, Humidity = {:.1f} %'.format(t, h))
+            print("[Sensor] Temp={:.1f} C, Humidity={:.1f} %".format(temp, humi))
 
-        lcd1602.clear()
-        lcd1602.show(str(t), 0, 0)
-        lcd1602.show(str(h), 1, 0)
+            lcd_event.set()
+            heater_event.set()
+            cooler_event.set()
+            humidifier_event.set()
+
+        except Exception as e:
+            print("[Sensor Error]:", e)
 
         await asleep_ms(5000)
 
-async def task_heater():
-    state = None
+async def task_LCD():
     while True:
-        if not sensor_ready:
-            await asleep_ms(200)
-            continue
+        await lcd_event.wait()
+        lcd_event.clear()
 
-        await data_lock.acquire()
-        t = shared_temp
-        data_lock.release()
+        try:
+            await data_mutex.acquire()
+            try:
+                temp = share_data["temperature"]
+                humi = share_data["humidity"]
+            finally:
+                data_mutex.release()
 
-        if t < HEATER_SAFE_MAX:
-            new_state = 'SAFE'
-            color = '#00ff00'
-        elif t < HEATER_WARNING_MAX:
-            new_state = 'WARNING'
-            color = '#ffa500'
-        else:
-            new_state = 'CRITICAL'
-            color = '#ff0000'
+            lcd1602.show("TEMP: {:.1f} C".format(temp).ljust(16), 0, 0)
+            lcd1602.show("HUMI: {:.1f} %".format(humi).ljust(16), 1, 0)
 
-        if new_state != state:
-            state = new_state
-            rgb_led_D3.show(0, hex_to_rgb(color))
-            print('[Heater] state -> {} (temp={})'.format(state, t))
+        except Exception as e:
+            print("[LCD Error]:", e)
 
-        await asleep_ms(500)
+async def task_heater():
+    current_state = None
+    while True:
+        await heater_event.wait()
+        heater_event.clear()
+
+        try:
+            await data_mutex.acquire()
+            try:
+                temp = share_data["temperature"]
+            finally:
+                data_mutex.release()
+
+            if temp < HEATER_SAFE_MAX:
+                state = "SAFE"
+                color = GREEN
+            elif temp <= HEATER_WARNING_MAX:
+                state = "WARNING"
+                color = ORANGE
+            else:
+                state = "DANGER"
+                color = RED
+
+            if state != current_state:
+                current_state = state
+                heater_led.show(0, color)
+                print("[Heater] {} : {:.1f} C".format(state, temp))
+
+        except Exception as e:
+            print("[Heater Error]:", e)
 
 async def task_cooler():
     while True:
-        if not sensor_ready:
-            await asleep_ms(200)
-            continue
+        await cooler_event.wait()
+        cooler_event.clear()
 
-        await data_lock.acquire()
-        t = shared_temp
-        data_lock.release()
+        try:
+            await data_mutex.acquire()
+            try:
+                temp = share_data["temperature"]
+            finally:
+                data_mutex.release()
 
-        if t > COOLER_THRESHOLD:
-            print('[Cooler] temp={} > {} -> activating for {} ms'.format(
-                t, COOLER_THRESHOLD, COOLER_DURATION_MS))
-            rgb_led_D5.show(0, hex_to_rgb('#00ff00'))
-            await asleep_ms(COOLER_DURATION_MS)
-            rgb_led_D5.show(0, hex_to_rgb('#000000'))
-        else:
-            await asleep_ms(500)
+            if temp > COOLER_THRESHOLD:
+                print("[Cooler] ON - Temperature {:.1f} C".format(temp))
+                cooler_led.show(0, GREEN)
+                await asleep_ms(COOLER_DURATION_MS)
+                cooler_led.show(0, OFF)
+                print("[Cooler] OFF after {} ms".format(COOLER_DURATION_MS))
+            else:
+                cooler_led.show(0, OFF)
+
+        except Exception as e:
+            print("[Cooler Error]:", e)
 
 async def task_humidifier():
+    state = "IDLE"
     while True:
-        if not sensor_ready:
-            await asleep_ms(200)
-            continue
+        try:
+            if state == "IDLE":
+                await humidifier_event.wait()
+                humidifier_event.clear()
 
-        await data_lock.acquire()
-        h = shared_humidity
-        data_lock.release()
+                await data_mutex.acquire()
+                try:
+                    humi = share_data["humidity"]
+                finally:
+                    data_mutex.release()
 
-        if h < HUMIDITY_THRESHOLD:
-            print('[Humidifier] humidity={} < {} -> running cycle'.format(
-                h, HUMIDITY_THRESHOLD))
+                if humi < HUMIDITY_THRESHOLD:
+                    print("[Humidifier] Start cycle - Humidity {:.1f}%".format(humi))
+                    state = "GREEN"
+                else:
+                    humidifier_led.show(0, OFF)
 
-            rgb_led_D7.show(0, hex_to_rgb('#00ff00'))   # GREEN
-            await asleep_ms(HUMIDIFIER_GREEN_MS)
+            elif state == "GREEN":
+                print("[Humidifier] GREEN")
+                humidifier_led.show(0, GREEN)
+                await asleep_ms(HUMIDIFIER_GREEN_TIME)
+                state = "YELLOW"
 
-            rgb_led_D7.show(0, hex_to_rgb('#ffff00'))   # YELLOW
-            await asleep_ms(HUMIDIFIER_YELLOW_MS)
+            elif state == "YELLOW":
+                print("[Humidifier] YELLOW")
+                humidifier_led.show(0, ORANGE)
+                await asleep_ms(HUMIDIFIER_YELLOW_TIME)
+                state = "RED"
 
-            rgb_led_D7.show(0, hex_to_rgb('#ff0000'))   # RED
-            await asleep_ms(HUMIDIFIER_RED_MS)
+            elif state == "RED":
+                print("[Humidifier] RED")
+                humidifier_led.show(0, RED)
+                await asleep_ms(HUMIDIFIER_RED_TIME)
+                humidifier_led.show(0, OFF)
 
-            rgb_led_D7.show(0, hex_to_rgb('#000000'))
-        else:
-            await asleep_ms(500)
+                await data_mutex.acquire()
+                try:
+                    humi = share_data["humidity"]
+                finally:
+                    data_mutex.release()
+
+                if humi < HUMIDITY_THRESHOLD:
+                    print("[Humidifier] Humidity still low {:.1f}% -> Repeat".format(humi))
+                    state = "GREEN"
+                else:
+                    print("[Humidifier] Humidity normal {:.1f}% -> IDLE".format(humi))
+                    state = "IDLE"
+
+        except Exception as e:
+            print("[Humidifier Error]:", e)
 
 async def setup():
-    print('App started')
+    print("System Started")
     create_task(task_LED_Blinky())
     create_task(task_read_sensor())
+    create_task(task_LCD())
     create_task(task_heater())
     create_task(task_cooler())
     create_task(task_humidifier())
